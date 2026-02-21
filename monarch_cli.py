@@ -3,27 +3,17 @@ import asyncio
 from contextlib import contextmanager
 import getpass
 import os
+import re
 import shutil
 import sys
 import textwrap
 from decimal import Decimal, ROUND_HALF_UP
+from itertools import cycle
+from typing import Awaitable
 from typing import Any, Dict, List, Optional, Tuple
 
 from monarch import Monarch, RequireMFAException
 
-try:
-    import keyring
-    from keyring.errors import KeyringError
-except ImportError:  # pragma: no cover
-    keyring = None
-    KeyringError = Exception
-
-
-KEYRING_SERVICE = "monarch-tool"
-KEY_EMAIL = "email"
-KEY_PASSWORD = "password"
-KEY_TOKEN = "token"
-KEY_MFA_SECRET = "mfa_secret"
 
 BACK = "__back__"
 QUIT = "__quit__"
@@ -50,6 +40,51 @@ def _supports_emoji() -> bool:
         return True
     except UnicodeEncodeError:
         return False
+
+
+def _highlight_line(text: str, color: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    start = f"\033[{color}m"
+    end = "\033[0m"
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return f"{start}{plain}{end}"
+
+
+def _pad_ansi(text: str, width: int, align: str = "left") -> str:
+    visible = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    pad = max(0, width - len(visible))
+    if pad == 0:
+        return text
+    if align == "right":
+        return (" " * pad) + text
+    return text + (" " * pad)
+
+
+async def _with_spinner(awaitable: Awaitable[Any]) -> Any:
+    if not sys.stdout.isatty():
+        return await awaitable
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    done = asyncio.Event()
+
+    async def _spin() -> None:
+        for frame in cycle(frames):
+            if done.is_set():
+                break
+            print(f"\r{frame}", end="", flush=True)
+            await asyncio.sleep(0.1)
+
+    task = asyncio.create_task(_spin())
+    try:
+        result = await awaitable
+    finally:
+        done.set()
+        try:
+            await task
+        except Exception:
+            pass
+        print("\r \r", end="", flush=True)
+    return result
 
 
 def _style(text: str, *, color: Optional[str] = None, bold: bool = False, use_color: bool = True) -> str:
@@ -95,7 +130,17 @@ def _format_amount(value: Any) -> str:
     number = _to_decimal(value)
     if number is None:
         return str(value)
-    return f"${_to_cents(number):,.2f}"
+    return f"${_to_cents(abs(number)):,.2f}"
+
+
+def _format_tx_amount(value: Any, use_color: bool, resume_color: Optional[str] = None) -> str:
+    number = _to_decimal(value)
+    if number is None:
+        return _format_amount(value)
+    amount = _format_amount(number)
+    if use_color and number > 0 and resume_color is None:
+        return _style(amount, color="32", use_color=use_color)
+    return amount
 
 
 def _prompt(message: str) -> str:
@@ -184,10 +229,15 @@ def _choose_single_tui(
     instructions: Optional[str] = None,
     use_color: bool,
     searchable: bool = False,
+    selectable: Optional[List[bool]] = None,
+    search_texts: Optional[List[str]] = None,
+    marker_mode: str = "cursor",
 ) -> Any:
     if not options:
         return BACK
 
+    selectable_flags = selectable or [True] * len(options)
+    search_source = search_texts or options
     cursor = 0
     query = ""
     message = ""
@@ -198,10 +248,23 @@ def _choose_single_tui(
             if searchable and query:
                 term = query.lower()
                 filtered_indexes = [
-                    idx for idx, option in enumerate(options) if term in option.lower()
+                    idx for idx, option in enumerate(search_source) if term in option.lower()
                 ]
-                if cursor >= len(filtered_indexes):
-                    cursor = max(0, len(filtered_indexes) - 1)
+                if selectable:
+                    heading_indexes: List[int] = []
+                    for idx in filtered_indexes:
+                        if selectable_flags[idx]:
+                            for prev in range(idx - 1, -1, -1):
+                                if not selectable_flags[prev]:
+                                    heading_indexes.append(prev)
+                                    break
+                    if heading_indexes:
+                        include = set(filtered_indexes + heading_indexes)
+                        filtered_indexes = [idx for idx in range(len(options)) if idx in include]
+
+            selectable_indexes = [idx for idx in filtered_indexes if selectable_flags[idx]]
+            if cursor >= len(selectable_indexes):
+                cursor = max(0, len(selectable_indexes) - 1)
 
             lines: List[str] = []
             lines.append(_style(title, bold=True, color="36", use_color=use_color))
@@ -217,19 +280,32 @@ def _choose_single_tui(
             height = shutil.get_terminal_size(fallback=(120, 30)).lines
             visible = max(5, height - len(lines) - 2)
 
-            if filtered_indexes:
-                start = max(0, cursor - visible + 1)
+            if selectable_indexes:
+                cursor_idx = selectable_indexes[cursor]
+                cursor_pos = filtered_indexes.index(cursor_idx)
+                start = max(0, cursor_pos - visible + 1)
                 end = min(len(filtered_indexes), start + visible)
-                if cursor < start:
-                    start = cursor
-                if cursor >= end:
-                    start = cursor - visible + 1
+                if cursor_pos < start:
+                    start = cursor_pos
+                    end = min(len(filtered_indexes), start + visible)
+                if cursor_pos >= end:
+                    start = cursor_pos - visible + 1
                     end = min(len(filtered_indexes), start + visible)
 
-                for pos in range(start, end):
-                    option_idx = filtered_indexes[pos]
-                    prefix = "▸" if pos == cursor else " "
-                    lines.append(f"{prefix} {options[option_idx]}")
+                display_indexes = filtered_indexes[start:end]
+
+                for option_idx in display_indexes:
+                    is_selectable = selectable_flags[option_idx]
+                    is_cursor = is_selectable and option_idx == cursor_idx
+                    prefix = "  "
+                    if is_selectable and marker_mode == "all":
+                        prefix = "\u25cf" if is_cursor else "\u25cb"
+                    elif is_selectable and marker_mode == "cursor":
+                        prefix = "\u25cf" if is_cursor else " "
+                    line = f"{prefix} {options[option_idx]}"
+                    if is_cursor:
+                        line = _highlight_line(line, color="33", use_color=use_color)
+                    lines.append(line)
             else:
                 lines.append("  (no matches)")
 
@@ -243,12 +319,12 @@ def _choose_single_tui(
                 cursor = max(0, cursor - 1)
                 continue
             if key in {"down", "j"}:
-                max_cursor = max(0, len(filtered_indexes) - 1)
+                max_cursor = max(0, len(selectable_indexes) - 1)
                 cursor = min(max_cursor, cursor + 1)
                 continue
             if key == "enter":
-                if filtered_indexes:
-                    return filtered_indexes[cursor]
+                if selectable_indexes:
+                    return selectable_indexes[cursor]
                 message = "Nothing matches your filter."
                 continue
             if key in {"b", "esc"}:
@@ -266,111 +342,52 @@ def _choose_single_tui(
                 cursor = 0
 
 
-def _ensure_keyring() -> None:
-    if keyring is None:
-        raise RuntimeError("The 'keyring' package is required. Install it with: pip install keyring")
-
-
-def _get_secret(name: str) -> Optional[str]:
-    _ensure_keyring()
-    try:
-        return keyring.get_password(KEYRING_SERVICE, name)
-    except KeyringError as exc:
-        raise RuntimeError(f"Unable to read from keyring: {exc}") from exc
-
-
-def _set_secret(name: str, value: str) -> None:
-    _ensure_keyring()
-    try:
-        keyring.set_password(KEYRING_SERVICE, name, value)
-    except KeyringError as exc:
-        raise RuntimeError(f"Unable to write to keyring: {exc}") from exc
-
-
-def _delete_secret(name: str) -> None:
-    _ensure_keyring()
-    try:
-        keyring.delete_password(KEYRING_SERVICE, name)
-    except KeyringError:
-        pass
-
-
-def _load_dotenv(path: str = ".env") -> None:
-    if not os.path.exists(path):
-        return
-    with open(path, "r", encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not key or key in os.environ:
-                continue
-            value = value.strip().strip('"').strip("'")
-            os.environ[key] = value
-
-
 async def _authenticate() -> Monarch:
-    env_email = os.getenv("MONARCH_EMAIL")
-    env_password = os.getenv("MONARCH_PASSWORD")
-    env_mfa_secret = os.getenv("MONARCH_MFA_SECRET")
-
-    token = _get_secret(KEY_TOKEN)
-    if token:
-        mm = Monarch(token=token)
+    mm = Monarch()
+    session_path = mm._session_file
+    if os.path.exists(session_path):
         try:
-            await mm.get_accounts()
+            mm.load_session(session_path)
+            await _with_spinner(mm.get_accounts())
             return mm
         except Exception:
-            _delete_secret(KEY_TOKEN)
+            print("Saved session is no longer valid. Re-authentication required.")
+            try:
+                mm.delete_session(session_path)
+            except Exception:
+                pass
 
-    email = env_email or _get_secret(KEY_EMAIL) or _prompt("Monarch email: ")
-    password = env_password or _get_secret(KEY_PASSWORD) or getpass.getpass("Monarch password: ")
-    if not email or not password:
-        raise RuntimeError("Email and password are required.")
-
-    mfa_secret = env_mfa_secret or _get_secret(KEY_MFA_SECRET)
-
-    mm = Monarch()
-    try:
-        await mm.login(
-            email=email,
-            password=password,
-            use_saved_session=False,
-            save_session=False,
-            mfa_secret_key=mfa_secret,
-        )
-    except RequireMFAException:
-        entered_secret = _prompt("MFA secret key (recommended, leave blank to use one-time code): ")
-        if entered_secret:
+    async def _login_with_prompts(email: str, password: str) -> Monarch:
+        mm = Monarch()
+        try:
             await mm.login(
                 email=email,
                 password=password,
                 use_saved_session=False,
-                save_session=False,
-                mfa_secret_key=entered_secret,
+                save_session=True,
             )
-            mfa_secret = entered_secret
-            _set_secret(KEY_MFA_SECRET, entered_secret)
-        else:
+            return mm
+        except RequireMFAException:
             mfa_code = _prompt("Two-factor code: ")
             try:
                 await mm.multi_factor_authenticate(email, password, mfa_code)
             except Exception as exc:
                 raise RuntimeError(
                     "Manual MFA code login failed in the installed monarch package. "
-                    "Use your MFA secret key so login can include TOTP in the initial request."
+                    "Use your MFA app to generate a new code and try again."
                 ) from exc
+            try:
+                mm.save_session()
+            except Exception:
+                pass
+            return mm
 
-    _set_secret(KEY_EMAIL, email)
-    _set_secret(KEY_PASSWORD, password)
-    if mm.token:
-        _set_secret(KEY_TOKEN, mm.token)
-    if mfa_secret:
-        _set_secret(KEY_MFA_SECRET, mfa_secret)
+    email = _prompt("Monarch email: ")
+    password = getpass.getpass("Monarch password: ")
+    if not email or not password:
+        raise RuntimeError("Email and password are required.")
 
-    return mm
+    return await _login_with_prompts(email, password)
 
 
 async def _get_transactions_needing_review(mm: Monarch) -> List[Dict[str, Any]]:
@@ -380,7 +397,7 @@ async def _get_transactions_needing_review(mm: Monarch) -> List[Dict[str, Any]]:
     total_count: Optional[int] = None
 
     while total_count is None or offset < total_count:
-        response = await mm.get_transactions(limit=limit, offset=offset)
+        response = await _with_spinner(mm.get_transactions(limit=limit, offset=offset))
         all_transactions = (response or {}).get("allTransactions", {})
         total_count = all_transactions.get("totalCount", 0)
         page = all_transactions.get("results", [])
@@ -462,6 +479,27 @@ def _merchant_name(tx: Dict[str, Any]) -> str:
     return (tx.get("merchant") or {}).get("name") or tx.get("plaidName") or "Unknown merchant"
 
 
+def _split_marker(tx: Dict[str, Any], use_color: bool) -> Tuple[str, str]:
+    if not bool(tx.get("isSplitTransaction")):
+        return "", ""
+    raw = " \u2387"
+    return raw, _style(raw, color="36", use_color=use_color)
+
+
+def _format_transaction_row(tx: Dict[str, Any], use_color: bool, *, include_index: Optional[int] = None, highlight_color: Optional[str] = None) -> str:
+    date = str(tx.get("date", "unknown-date"))
+    amount = _format_tx_amount(tx.get("amount"), use_color=use_color, resume_color=highlight_color)
+    amount = _pad_ansi(amount, 10, align="right")
+    split_raw, split_marker = _split_marker(tx, use_color=use_color)
+    merchant_width = 34 - len(split_raw)
+    merchant = _truncate(_merchant_name(tx), merchant_width)
+    account = _truncate((tx.get("account") or {}).get("displayName", "Unknown account"), 24)
+    base = f"{date}  {amount}  {merchant:<{merchant_width}}{split_marker}  {account}"
+    if include_index is None:
+        return base
+    return f"[{include_index:>2}] {base}"
+
+
 def _print_review_transactions(transactions: List[Dict[str, Any]], use_color: bool, show_details: bool, use_emoji: bool) -> None:
     if not transactions:
         print(_style("No transactions need review.", color="32", bold=True, use_color=use_color))
@@ -472,37 +510,7 @@ def _print_review_transactions(transactions: List[Dict[str, Any]], use_color: bo
     numeric_amounts = [value for value in amounts if value is not None]
 
     columns = shutil.get_terminal_size(fallback=(120, 20)).columns
-    date_w = 10
-    flags_w = 10
-    amount_w = 12
-    account_w = 22
-    category_w = 18
-    static_width = date_w + flags_w + amount_w + account_w + category_w + 17
-    merchant_w = max(20, columns - static_width)
-
-    if use_emoji:
-        pending_marker = "⏳"
-        needs_review_marker = "🔎"
-        reviewed_marker = "✅"
-        unknown_marker = "❔"
-        recurring_marker = "🔁"
-        split_marker = "✂"
-        attachment_marker = "📎"
-        empty_marker = "·"
-        legend = "Flags: ⏳=pending, 🔎/✅=review status, 🔁=recurring, ✂=split, 📎=attachments"
-    else:
-        pending_marker = "P"
-        needs_review_marker = "!"
-        reviewed_marker = "v"
-        unknown_marker = "?"
-        recurring_marker = "R"
-        split_marker = "S"
-        attachment_marker = "A"
-        empty_marker = "."
-        legend = "Flags: P=pending, !/v=review status, R=recurring, S=split, A=attachments"
-
-    header = f"{'Date':<{date_w}}  {'Flags':<{flags_w}}  {'Amount':>{amount_w}}  {'Merchant':<{merchant_w}}  {'Account':<{account_w}}  {'Category':<{category_w}}"
-    divider = "-" * min(len(header), columns)
+    divider = "-" * min(columns, 120)
 
     print(_style("Transactions Needing Review", color="36", bold=True, use_color=use_color))
     print(
@@ -510,79 +518,49 @@ def _print_review_transactions(transactions: List[Dict[str, Any]], use_color: bo
         f"in {_format_amount(sum(v for v in numeric_amounts if v > 0))} | "
         f"out {_format_amount(sum(v for v in numeric_amounts if v < 0))}"
     )
-    print(legend)
-    print(divider)
-    print(_style(header, bold=True, use_color=use_color))
     print(divider)
 
     for tx in sorted_transactions:
-        date = str(tx.get("date", "unknown-date"))
-        amount_value = _to_float(tx.get("amount"))
-        amount_str = _format_amount(tx.get("amount"))
-        merchant = _merchant_name(tx)
-        category = (tx.get("category") or {}).get("name") or "Uncategorized"
-        account = (tx.get("account") or {}).get("displayName") or "Unknown account"
-        flags = (
-            _to_bool_marker(tx.get("pending"), pending_marker, empty_marker)
-            + _review_status_marker(tx.get("reviewStatus"), needs_review_marker, reviewed_marker, unknown_marker, empty_marker)
-            + _to_bool_marker(tx.get("isRecurring"), recurring_marker, empty_marker)
-            + _to_bool_marker(tx.get("isSplitTransaction"), split_marker, empty_marker)
-            + _to_bool_marker(bool(tx.get("attachments")), attachment_marker, empty_marker)
-        )
-
-        date_cell = _truncate(date, date_w).ljust(date_w)
-        flags_cell = _truncate(flags, flags_w).ljust(flags_w)
-        amount_cell_plain = _truncate(amount_str, amount_w).rjust(amount_w)
-        if amount_value is None:
-            amount_cell = amount_cell_plain
-        elif amount_value < 0:
-            amount_cell = _style(amount_cell_plain, color="31", use_color=use_color)
-        else:
-            amount_cell = _style(amount_cell_plain, color="32", use_color=use_color)
-
-        print(
-            f"{date_cell}  {flags_cell}  {amount_cell}  {_truncate(merchant, merchant_w).ljust(merchant_w)}  "
-            f"{_truncate(account, account_w).ljust(account_w)}  {_truncate(category, category_w).ljust(category_w)}"
-        )
+        print(_format_transaction_row(tx, use_color=use_color))
         if show_details:
             _print_detail_lines(tx, columns)
-            print()
 
-async def _get_retail_syncs(mm: Monarch) -> List[Dict[str, Any]]:
-    syncs: List[Dict[str, Any]] = []
-    offset = 0
-    limit = 100
-    total_count: Optional[int] = None
-
-    while total_count is None or offset < total_count:
-        response = await mm.get_retail_syncs_with_total(offset=offset, limit=limit)
-        data = (response or {}).get("retailSyncsWithTotal", {})
-        total_count = data.get("totalCount", 0)
-        page = data.get("results", [])
-        if not page:
-            break
-        syncs.extend(page)
-        offset += len(page)
-
-    return syncs
-
-
-async def _get_active_categories(mm: Monarch) -> List[Dict[str, Any]]:
-    response = await mm.get_transaction_categories()
-    categories = (response or {}).get("categories", [])
-    active = [cat for cat in categories if not cat.get("isDisabled")]
-    active.sort(
-        key=lambda cat: (
-            str((cat.get("group") or {}).get("type", "")).lower(),
-            str((cat.get("group") or {}).get("name", "")).lower(),
-            str(cat.get("name", "")).lower(),
-        )
-    )
-    return active
 
 
 def _get_review_transactions_for_match(review_transactions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [tx for tx in review_transactions if not bool(tx.get("isSplitTransaction"))]
+
+
+async def _get_active_categories(mm: Monarch) -> List[Dict[str, Any]]:
+    response = await _with_spinner(mm.get_transaction_categories())
+    categories = response.get("categories", []) if isinstance(response, dict) else []
+    return [cat for cat in categories if not cat.get("isDisabled")]
+
+
+async def _get_retail_syncs(mm: Monarch) -> List[Dict[str, Any]]:
+    syncs: List[Dict[str, Any]] = []
+    offset = 0
+    limit = 50
+    total: Optional[int] = None
+
+    while total is None or offset < total:
+        response = await _with_spinner(
+            mm.get_retail_syncs_with_total(
+            filters={},
+            offset=offset,
+            limit=limit,
+            include_total_count=True,
+            )
+        )
+        payload = response.get("retailSyncsWithTotal", {}) if isinstance(response, dict) else {}
+        total = payload.get("totalCount")
+        results = payload.get("results") or []
+        if not results:
+            break
+        syncs.extend(results)
+        offset += len(results)
+
+    return syncs
 
 
 def _amount_match(a: Any, b: Any) -> bool:
@@ -634,19 +612,13 @@ def _select_transaction_for_match(transactions: List[Dict[str, Any]], use_color:
         return None
 
     if _tui_enabled():
-        options = [
-            (
-                f"{str(tx.get('date', 'unknown-date'))}  {_format_amount(tx.get('amount')):>10}  "
-                f"{_truncate(_merchant_name(tx), 34):<34}  "
-                f"{_truncate((tx.get('account') or {}).get('displayName', 'Unknown account'), 24)}"
-            )
-            for tx in transactions
-        ]
+        options = [_format_transaction_row(tx, use_color=use_color) for tx in transactions]
         selection = _choose_single_tui(
             title="Pick A Transaction",
-            subtitle_lines=["Only transactions needing review and not already split are shown."],
+            subtitle_lines=["Only transactions needing review with receipt candidates are shown."],
             options=options,
             use_color=use_color,
+            marker_mode="cursor",
             instructions="↑/↓ move, Enter select, b/esc back, q quit",
         )
         if selection in {BACK, QUIT}:
@@ -656,15 +628,11 @@ def _select_transaction_for_match(transactions: List[Dict[str, Any]], use_color:
     columns = shutil.get_terminal_size(fallback=(120, 20)).columns
     divider = "-" * min(columns, 120)
     print(_style("Pick A Transaction", bold=True, color="36", use_color=use_color))
-    print("Only transactions needing review and not already split are shown.")
+    print("Only transactions needing review with receipt candidates are shown.")
     print(divider)
 
     for index, tx in enumerate(transactions, start=1):
-        print(
-            f"[{index:>2}] {str(tx.get('date', 'unknown-date'))}  {_format_amount(tx.get('amount')):>10}  "
-            f"{_truncate(_merchant_name(tx), 34):<34}  "
-            f"{_truncate((tx.get('account') or {}).get('displayName', 'Unknown account'), 24)}"
-        )
+        print(_format_transaction_row(tx, use_color=use_color, include_index=index))
 
     while True:
         raw = _prompt("\nSelect transaction #, or q to quit: ").lower()
@@ -688,12 +656,15 @@ def _select_order_candidate(candidates: List[Dict[str, Any]], transaction: Dict[
             order = candidate["order"]
             sync = candidate["sync"]
             line_item_count = len(candidate["line_items"])
-            matched = "matched" if candidate["already_matched"] else "unmatched"
+            tx_amount = _to_decimal(transaction.get("amount")) or Decimal("0")
+            amount_value = _to_decimal(order.get("grandTotal")) or Decimal("0")
+            signed_amount = amount_value if tx_amount >= 0 else -amount_value
+            amount = _pad_ansi(_format_tx_amount(signed_amount, use_color=use_color), 10, align="right")
             options.append(
                 f"{order.get('date', '-')}  "
+                f"{amount}  "
                 f"{_truncate(str(order.get('merchantName', '-')), 24):<24}  "
-                f"{_format_amount(order.get('grandTotal')):>10}  "
-                f"items={line_item_count:<3}  {matched:<9}  "
+                f"{line_item_count} items  "
                 f"{order.get('displayStatus') or sync.get('status') or '-'}"
             )
 
@@ -705,6 +676,7 @@ def _select_order_candidate(candidates: List[Dict[str, Any]], transaction: Dict[
             ],
             options=options,
             use_color=use_color,
+            marker_mode="cursor",
             instructions="↑/↓ move, Enter select, b/esc back, q quit",
         )
         if selection in {BACK, QUIT}:
@@ -722,12 +694,15 @@ def _select_order_candidate(candidates: List[Dict[str, Any]], transaction: Dict[
         order = candidate["order"]
         sync = candidate["sync"]
         line_item_count = len(candidate["line_items"])
-        matched = "matched" if candidate["already_matched"] else "unmatched"
+        tx_amount = _to_decimal(transaction.get("amount")) or Decimal("0")
+        amount_value = _to_decimal(order.get("grandTotal")) or Decimal("0")
+        signed_amount = amount_value if tx_amount >= 0 else -amount_value
+        amount = _pad_ansi(_format_tx_amount(signed_amount, use_color=use_color), 10, align="right")
         print(
             f"[{index:>2}] {order.get('date', '-')}  "
+            f"{amount}  "
             f"{_truncate(str(order.get('merchantName', '-')), 24):<24}  "
-            f"{_format_amount(order.get('grandTotal')):>10}  "
-            f"items={line_item_count:<3}  {matched:<9}  "
+            f"{line_item_count} items  "
             f"{order.get('displayStatus') or sync.get('status') or '-'}"
         )
 
@@ -744,50 +719,94 @@ def _select_order_candidate(candidates: List[Dict[str, Any]], transaction: Dict[
         print("Invalid selection.")
 
 
-def _get_category_display(category: Dict[str, Any]) -> str:
+def _category_group_type(category: Dict[str, Any]) -> str:
     group = category.get("group") or {}
-    group_name = group.get("name", "Ungrouped")
-    group_type = str(group.get("type", "")).lower() or "other"
-    return f"{group_name} [{group_type}] / {category.get('name', 'Unknown')}"
+    return str(group.get("type", "")).lower() or "other"
+
+
+def _category_group_name(category: Dict[str, Any]) -> str:
+    group = category.get("group") or {}
+    return group.get("name") or "Ungrouped"
+
+
+def _build_category_menu(
+    categories: List[Dict[str, Any]], preferred_type: Optional[str], use_color: bool
+) -> Tuple[List[str], List[bool], List[str], List[Optional[Dict[str, Any]]]]:
+    color_by_type = {"income": "32", "expense": "31", "transfer": "36", "other": "36"}
+
+    options: List[str] = []
+    selectable: List[bool] = []
+    search_texts: List[str] = []
+    category_for_option: List[Optional[Dict[str, Any]]] = []
+
+    group_items: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    group_order: List[Tuple[str, str]] = []
+    for cat in categories:
+        group_type = _category_group_type(cat)
+        group_name = _category_group_name(cat)
+        group_key = (group_type, group_name)
+        if group_key not in group_items:
+            group_items[group_key] = []
+            group_order.append(group_key)
+        group_items[group_key].append(cat)
+
+    for group_type, group_name in group_order:
+        heading = _style(group_name, color=color_by_type.get(group_type, "36"), bold=True, use_color=use_color)
+        options.append(heading)
+        selectable.append(False)
+        search_texts.append("")
+        category_for_option.append(None)
+        for cat in group_items[(group_type, group_name)]:
+            options.append(f"  {cat.get('name', 'Unknown')}")
+            selectable.append(True)
+            search_texts.append(f"{group_name} {cat.get('name', '')}".lower())
+            category_for_option.append(cat)
+
+    return options, selectable, search_texts, category_for_option
 
 
 def _select_category(categories: List[Dict[str, Any]], preferred_type: Optional[str], use_color: bool) -> Any:
-    filtered_categories = categories
-    if preferred_type:
-        preferred = [
-            cat
-            for cat in categories
-            if str((cat.get("group") or {}).get("type", "")).lower() == preferred_type
-        ]
-        if preferred:
-            filtered_categories = preferred
-
     if _tui_enabled():
-        options = [_get_category_display(cat) for cat in filtered_categories]
-        subtitle = []
-        if preferred_type:
-            subtitle.append(f"Showing {preferred_type} categories first.")
+        options, selectable, search_texts, category_for_option = _build_category_menu(
+            categories, preferred_type, use_color
+        )
+        subtitle = ["Income, expense, and transfer categories are available."]
         selection = _choose_single_tui(
             title="Select Category",
             subtitle_lines=subtitle,
             options=options,
+            selectable=selectable,
+            search_texts=search_texts,
             use_color=use_color,
             searchable=True,
+            marker_mode="cursor",
             instructions="↑/↓ move, Enter select, type to filter, Backspace delete, b/esc back, q quit",
         )
         if selection in {BACK, QUIT}:
             return selection
-        return filtered_categories[selection]
+        return category_for_option[selection]
 
     search = ""
     page = 0
     page_size = 20
+    options, selectable, search_texts, category_for_option = _build_category_menu(
+        categories, preferred_type, use_color=False
+    )
+    selectable_categories = [
+        (idx, cat)
+        for idx, cat in enumerate(category_for_option)
+        if cat is not None
+    ]
 
     while True:
-        view = filtered_categories
+        view = selectable_categories
         if search:
             term = search.lower()
-            view = [cat for cat in filtered_categories if term in _get_category_display(cat).lower()]
+            view = [
+                (idx, cat)
+                for idx, cat in selectable_categories
+                if term in search_texts[idx]
+            ]
 
         if not view:
             print("No categories match this search.")
@@ -802,10 +821,11 @@ def _select_category(categories: List[Dict[str, Any]], preferred_type: Optional[
         print()
         print(_style("Select Category", bold=True, color="36", use_color=use_color))
         if preferred_type:
-            print(f"Showing {preferred_type} categories first.")
+            print(f"Preferred type: {preferred_type}.")
         print(f"Page {page + 1}/{total_pages} | Commands: n/p page, s <text> search, c clear, b back, q quit")
-        for idx, category in enumerate(page_items, start=1):
-            print(f"[{idx:>2}] {_get_category_display(category)}")
+        for idx, (_, category) in enumerate(page_items, start=1):
+            group_name = _category_group_name(category)
+            print(f"[{idx:>2}] {group_name} / {category.get('name', 'Unknown')}")
 
         raw = _prompt("Category selection: ")
         lower = raw.lower()
@@ -830,11 +850,17 @@ def _select_category(categories: List[Dict[str, Any]], preferred_type: Optional[
         if raw.isdigit():
             choice = int(raw)
             if 1 <= choice <= len(page_items):
-                return page_items[choice - 1]
+                return page_items[choice - 1][1]
         print("Invalid selection.")
 
 def _line_item_total(item: Dict[str, Any]) -> Decimal:
     return abs(_to_cents(_to_decimal(item.get("total")) or Decimal("0")))
+
+
+def _signed_line_item_total(item: Dict[str, Any], transaction_amount: Any) -> Decimal:
+    base = _line_item_total(item)
+    sign = -1 if (_to_decimal(transaction_amount) or 0) < 0 else 1
+    return base * sign
 
 
 def _line_item_label(item: Dict[str, Any]) -> str:
@@ -906,17 +932,23 @@ def _select_line_items_and_categories_tui(
                 assigned_label = (
                     assigned_category.get("name", "-") if assigned_category else "unassigned"
                 )
-                amount = _format_amount(_line_item_total(item))
-                pointer = "▸" if idx == cursor else " "
-                checkbox = "☑" if idx in selected else "☐"
+                amount = _pad_ansi(
+                    _format_tx_amount(_signed_line_item_total(item, transaction_amount), use_color=use_color),
+                    10,
+                    align="right",
+                )
+                marker = "\u25cf" if idx in selected else "\u25cb"
                 line = (
-                    f"{pointer} {checkbox} {idx + 1:>2}. {amount:>10}  "
+                    f"{marker} {idx + 1:>2}. {amount}  "
                     f"{_truncate(_line_item_label(item), 42):<42} -> {assigned_label}"
                 )
-                if assigned_category:
-                    lines.append(_style(line, color="90", use_color=use_color))
-                else:
-                    lines.append(line)
+                if idx == cursor:
+                    line = _highlight_line(line, color="33", use_color=use_color)
+                elif idx in selected:
+                    line = _style(line, color="96", use_color=use_color)
+                elif assigned_category:
+                    line = _style(line, color="90", use_color=use_color)
+                lines.append(line)
 
             _clear_screen()
             print("\n".join(lines))
@@ -957,6 +989,11 @@ def _select_line_items_and_categories_tui(
                 status = "Assign all items before continuing."
                 continue
             if key == "enter":
+                if not selected:
+                    if assigned_count == len(line_items):
+                        return assignments
+                    status = "Assign all items before continuing."
+                    continue
                 target_indexes = sorted(selected) if selected else [cursor]
                 category = _select_category(
                     categories,
@@ -1014,11 +1051,15 @@ def _select_line_items_and_categories(
             item_id = str(item.get("id"))
             assigned_category = assignments.get(item_id)
             assigned_label = assigned_category.get("name", "-") if assigned_category else "unassigned"
-            amount = _format_amount(_line_item_total(item))
+            amount = _pad_ansi(
+                _format_tx_amount(_signed_line_item_total(item, transaction_amount), use_color=use_color),
+                10,
+                align="right",
+            )
             marker = "[x]" if assigned_category else "[ ]"
-            line = f"{marker} [{index:>2}] {amount:>10}  {_truncate(_line_item_label(item), 44):<44} -> {assigned_label}"
+            line = f"{marker} [{index:>2}] {amount}  {_truncate(_line_item_label(item), 44):<44} -> {assigned_label}"
             if assigned_category:
-                print(_style(line, color="90", use_color=use_color))
+                print(_style(line, color="37", use_color=use_color))
             else:
                 all_assigned = False
                 print(line)
@@ -1184,12 +1225,32 @@ def _print_split_preview(preview_rows: List[Dict[str, Any]], tx_amount: Decimal,
     if order_tax is not None:
         print(f"Receipt tax: {_format_amount(order_tax)}")
 
-    for row in preview_rows:
+    rows = [
+        {
+            "category": str(row.get("category_name", "-")),
+            "items": int(row.get("line_item_count") or 0),
+            "base": row.get("base"),
+            "delta": row.get("delta_share"),
+            "split": row.get("split_amount"),
+        }
+        for row in preview_rows
+    ]
+    if not rows:
+        print("No split rows to display.")
+        return
+    cat_w = max(12, min(32, max(len(r["category"]) for r in rows)))
+    print()
+    header = f"{'Category':<{cat_w}}  {'Items':>5}  {'Base':>12}  {'Remainder':>12}  {'Split':>12}"
+    print(_style(header, bold=True, color="90", use_color=use_color))
+    for row in rows:
         print(
-            f"- {row['category_name']} ({row['line_item_count']} item(s)): "
-            f"base {_format_amount(row['base'])} + distributed {_format_amount(row['delta_share'])} "
-            f"=> split {_format_amount(row['split_amount'])}"
+            f"{_truncate(row['category'], cat_w):<{cat_w}}  "
+            f"{row['items']:>5}  "
+            f"{_format_amount(row['base']):>12}  "
+            f"{_format_amount(row['delta']):>12}  "
+            f"{_format_amount(row['split']):>12}"
         )
+    print()
 
 
 async def _maybe_match_retail_transaction(mm: Monarch, transaction: Dict[str, Any], candidate: Dict[str, Any]) -> None:
@@ -1202,9 +1263,11 @@ async def _maybe_match_retail_transaction(mm: Monarch, transaction: Dict[str, An
     if ((selected.get("transaction") or {}).get("id")) == transaction.get("id"):
         return
 
-    response = await mm.match_retail_transaction(
-        retail_transaction_id=selected.get("id"),
-        transaction_id=transaction.get("id"),
+    response = await _with_spinner(
+        mm.match_retail_transaction(
+            retail_transaction_id=selected.get("id"),
+            transaction_id=transaction.get("id"),
+        )
     )
     errors = ((response or {}).get("matchRetailTransaction") or {}).get("errors") or []
     if errors:
@@ -1221,14 +1284,25 @@ async def _run_match_flow(mm: Monarch, review_transactions: List[Dict[str, Any]]
     if not categories:
         raise RuntimeError("No active categories found in Monarch.")
 
+    print("Loading retail syncs...")
+    syncs = await _get_retail_syncs(mm)
+    candidates_by_tx: Dict[str, List[Dict[str, Any]]] = {}
+    for tx in transactions:
+        tx_id = str(tx.get("id", ""))
+        candidates = _build_order_candidates(tx, syncs)
+        if candidates:
+            candidates_by_tx[tx_id] = candidates
+
+    transactions = [tx for tx in transactions if str(tx.get("id", "")) in candidates_by_tx]
+    if not transactions:
+        print("No eligible transactions with receipt candidates.")
+        return 0
+
     while True:
         selected_tx = _select_transaction_for_match(transactions, use_color=use_color)
         if selected_tx is None:
             return 0
-
-        print("\nLoading retail syncs...")
-        syncs = await _get_retail_syncs(mm)
-        candidates = _build_order_candidates(selected_tx, syncs)
+        candidates = candidates_by_tx.get(str(selected_tx.get("id", "")), [])
 
         while True:
             candidate = _select_order_candidate(candidates, transaction=selected_tx, use_color=use_color)
@@ -1256,7 +1330,10 @@ async def _run_match_flow(mm: Monarch, review_transactions: List[Dict[str, Any]]
 
                 split_data, preview_rows, tx_amount, line_total, delta = _build_split_plan(selected_tx, order, assignments)
                 _print_split_preview(preview_rows, tx_amount, line_total, delta, order, use_color=use_color)
-                confirm = _prompt("Create these splits? [y]es / [b]ack / [q]uit: ").lower()
+                prompt = _style("Create these splits?", color="36", use_color=use_color) + " [Y]/n, b back, q quit: "
+                confirm = _prompt(prompt).strip().lower()
+                if confirm == "":
+                    confirm = "y"
                 if confirm in {"b", "back"}:
                     continue
                 if confirm in {"q", "quit"}:
@@ -1266,9 +1343,11 @@ async def _run_match_flow(mm: Monarch, review_transactions: List[Dict[str, Any]]
                     continue
 
                 await _maybe_match_retail_transaction(mm, selected_tx, candidate)
-                response = await mm.update_transaction_splits(
-                    transaction_id=selected_tx.get("id"),
-                    split_data=split_data,
+                response = await _with_spinner(
+                    mm.update_transaction_splits(
+                        transaction_id=selected_tx.get("id"),
+                        split_data=split_data,
+                    )
                 )
                 errors = ((response or {}).get("updateTransactionSplit") or {}).get("errors") or []
                 if errors:
@@ -1279,17 +1358,15 @@ async def _run_match_flow(mm: Monarch, review_transactions: List[Dict[str, Any]]
 
 
 async def _run_cli() -> int:
-    _load_dotenv()
-
     parser = argparse.ArgumentParser(description="Simple CLI for retrieving data from Monarch Money.")
     mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument("--review", dest="review", action="store_true", help="Show transactions that still need review.")
-    mode_group.add_argument("--match", dest="match", action="store_true", help="Interactive receipt matching and split categorization flow.")
+    mode_group.add_argument("--match-receipt", dest="match_receipt", action="store_true", help="Interactive receipt matching and split categorization flow.")
     parser.add_argument("--no-color", dest="no_color", action="store_true", help="Disable ANSI colors in output.")
     parser.add_argument("--details", dest="details", action="store_true", help="Show full details for each transaction below the main row (review mode).")
     args = parser.parse_args()
 
-    if not args.review and not args.match:
+    if not args.review and not args.match_receipt:
         parser.print_help()
         return 0
 

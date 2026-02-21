@@ -1,1 +1,4 @@
 .env
+.mm/
+.venv/
+__pycache__/
