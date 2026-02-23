@@ -2,7 +2,7 @@ import shutil
 import textwrap
 from typing import Any, Dict, List, Optional, Tuple
 
-from .formatting import (
+from ..formatting import (
     format_amount,
     format_tx_amount,
     pad_ansi,
@@ -10,7 +10,7 @@ from .formatting import (
     to_float,
     truncate,
 )
-from .terminal import with_spinner
+from ..terminal import with_spinner
 
 
 async def get_transactions_needing_review(mm: Any) -> List[Dict[str, Any]]:

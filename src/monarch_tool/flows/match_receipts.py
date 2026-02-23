@@ -2,8 +2,8 @@ import shutil
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
 
-from .constants import BACK, QUIT
-from .formatting import (
+from ..constants import BACK, QUIT
+from ..formatting import (
     format_amount,
     format_tx_amount,
     highlight_line,
@@ -13,9 +13,9 @@ from .formatting import (
     to_decimal,
     truncate,
 )
-from .menus import choose_single_tui
-from .terminal import clear_screen, hidden_cursor, prompt, read_key, tui_enabled, with_spinner
-from .transactions import format_transaction_row, get_review_transactions_for_match, merchant_name
+from ..menus import choose_single_tui
+from ..terminal import clear_screen, hidden_cursor, prompt, read_key, tui_enabled, with_spinner
+from .review import format_transaction_row, get_review_transactions_for_match, merchant_name
 
 
 async def get_active_categories(mm: Any) -> List[Dict[str, Any]]:

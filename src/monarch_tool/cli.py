@@ -3,9 +3,9 @@ import asyncio
 import sys
 
 from .auth import authenticate
-from .receipts import run_match_flow
+from .flows.match_receipts import run_match_flow
 from .terminal import enable_utf8_output, supports_color
-from .transactions import get_transactions_needing_review, print_review_transactions
+from .flows.review import get_transactions_needing_review, print_review_transactions
 
 
 async def _run_cli() -> int:
