@@ -1,3 +1,4 @@
+import mimetypes
 import shutil
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Tuple
@@ -14,6 +15,7 @@ from ..formatting import (
     truncate,
 )
 from ..menus import choose_single_tui
+from ..receipt_sync_accounts import load_receipt_sync_sources
 from ..terminal import clear_screen, hidden_cursor, prompt, read_key, tui_enabled, with_spinner
 from .review import format_transaction_row, get_review_transactions_for_match, merchant_name
 
@@ -58,12 +60,17 @@ def amount_match(a: Any, b: Any) -> bool:
     return to_cents(abs(a_dec)) == to_cents(abs(b_dec))
 
 
-def build_order_candidates(transaction: Dict[str, Any], syncs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def build_order_candidates(
+    transaction: Dict[str, Any],
+    sync_entries: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     tx_amount = transaction.get("amount")
     tx_id = transaction.get("id")
 
-    for sync in syncs:
+    for entry in sync_entries:
+        sync = entry.get("sync") or {}
+        sync_source = entry.get("source") or {}
         for order in sync.get("orders", []) or []:
             if not amount_match(order.get("grandTotal"), tx_amount):
                 continue
@@ -80,6 +87,7 @@ def build_order_candidates(transaction: Dict[str, Any], syncs: List[Dict[str, An
                     "line_items": order.get("retailLineItems") or [],
                     "retail_transactions": retail_transactions,
                     "already_matched": already_matched,
+                    "sync_source": sync_source,
                 }
             )
 
@@ -153,12 +161,14 @@ def select_order_candidate(
             amount_value = to_decimal(order.get("grandTotal")) or Decimal("0")
             signed_amount = amount_value if tx_amount >= 0 else -amount_value
             amount = pad_ansi(format_tx_amount(signed_amount, use_color=use_color), 10, align="right")
+            source_label = truncate(str((candidate.get("sync_source") or {}).get("label", "-")), 18)
             options.append(
                 f"{order.get('date', '-')}  "
                 f"{amount}  "
                 f"{truncate(str(order.get('merchantName', '-')), 24):<24}  "
                 f"{line_item_count} items  "
-                f"{order.get('displayStatus') or sync.get('status') or '-'}"
+                f"{order.get('displayStatus') or sync.get('status') or '-'}  "
+                f"{source_label}"
             )
 
         selection = choose_single_tui(
@@ -194,12 +204,14 @@ def select_order_candidate(
         amount_value = to_decimal(order.get("grandTotal")) or Decimal("0")
         signed_amount = amount_value if tx_amount >= 0 else -amount_value
         amount = pad_ansi(format_tx_amount(signed_amount, use_color=use_color), 10, align="right")
+        source_label = truncate(str((candidate.get("sync_source") or {}).get("label", "-")), 18)
         print(
             f"[{index:>2}] {order.get('date', '-')}  "
             f"{amount}  "
             f"{truncate(str(order.get('merchantName', '-')), 24):<24}  "
             f"{line_item_count} items  "
-            f"{order.get('displayStatus') or sync.get('status') or '-'}"
+            f"{order.get('displayStatus') or sync.get('status') or '-'}  "
+            f"{source_label}"
         )
 
     while True:
@@ -213,6 +225,265 @@ def select_order_candidate(
             if 1 <= choice <= len(candidates):
                 return candidates[choice - 1]
         print("Invalid selection.")
+
+
+def prompt_yes_no(question: str, default: bool = False) -> bool:
+    hint = "[Y]/n" if default else "y/[N]"
+    while True:
+        raw = prompt(f"{question} {hint}: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Invalid choice.")
+
+
+def format_quantity(value: Any) -> str:
+    qty = to_decimal(value)
+    if qty is None:
+        return "1"
+    if qty == qty.to_integral_value():
+        return str(int(qty))
+    text = format(qty.normalize(), "f")
+    text = text.rstrip("0").rstrip(".")
+    return text or "1"
+
+
+def build_line_item_notes_by_category(
+    order: Dict[str, Any],
+    assignments: Dict[str, Dict[str, Any]],
+) -> Dict[str, str]:
+    notes_lines: Dict[str, List[str]] = {}
+    line_items = order.get("retailLineItems") or []
+    for item in line_items:
+        item_id = str(item.get("id"))
+        category = assignments.get(item_id)
+        if not category:
+            continue
+
+        category_id = str(category.get("id") or "")
+        if not category_id:
+            continue
+        qty_label = format_quantity(item.get("quantity"))
+        title = str(item.get("title") or "Untitled item").strip()
+        total = format_amount(line_item_total(item))
+        line = f"{qty_label} x {title} - {total}"
+        notes_lines.setdefault(category_id, []).append(line)
+
+    return {category_id: "\n\n".join(lines) for category_id, lines in notes_lines.items() if lines}
+
+
+def _message_from_payload_error(payload: Any) -> str:
+    if isinstance(payload, dict):
+        message = payload.get("message")
+        if message:
+            return str(message)
+    return "unknown error"
+
+
+def _attachment_identity(attachment: Dict[str, Any]) -> Tuple[str, str, str]:
+    return (
+        str(attachment.get("publicId") or ""),
+        str(attachment.get("filename") or ""),
+        str(attachment.get("extension") or ""),
+    )
+
+
+async def attachment_exists_on_transaction(
+    mm: Any,
+    transaction_id: str,
+    attachment: Dict[str, Any],
+) -> bool:
+    target_public_id, target_filename, target_extension = _attachment_identity(attachment)
+    try:
+        details = await with_spinner(mm.get_transaction_details(transaction_id=transaction_id))
+    except Exception:
+        return False
+
+    tx = (details or {}).get("getTransaction") or {}
+    attachments = tx.get("attachments") or []
+    for existing in attachments:
+        if not isinstance(existing, dict):
+            continue
+        existing_public_id, existing_filename, existing_extension = _attachment_identity(existing)
+        if target_public_id and existing_public_id == target_public_id:
+            return True
+        if target_filename and target_extension and (
+            existing_filename == target_filename and existing_extension == target_extension
+        ):
+            return True
+    return False
+
+
+async def clone_attachment_to_transaction(
+    mm: Any,
+    transaction_id: str,
+    attachment: Dict[str, Any],
+) -> Optional[str]:
+    filename = attachment.get("filename")
+    extension = attachment.get("extension")
+    size_bytes = attachment.get("sizeBytes")
+    public_id = attachment.get("publicId")
+
+    if not filename or not extension:
+        return "attachment missing filename or extension"
+
+    try:
+        size_value = int(size_bytes) if size_bytes is not None else 0
+    except (TypeError, ValueError):
+        size_value = 0
+
+    direct_failure_reason: Optional[str] = None
+    if public_id:
+        try:
+            direct_response = await with_spinner(
+                mm.add_transaction_attachment(
+                    {
+                        "transactionId": transaction_id,
+                        "publicId": str(public_id),
+                        "filename": str(filename),
+                        "extension": str(extension),
+                        "sizeBytes": size_value,
+                    }
+                )
+            )
+            payload = (direct_response or {}).get("addTransactionAttachment") or {}
+            direct_errors = payload.get("errors") or []
+            if not direct_errors:
+                return None
+            direct_failure_reason = _message_from_payload_error(direct_errors[0])
+        except Exception as exc:
+            direct_failure_reason = str(exc)
+
+        # Some Monarch responses report errors even when the attachment is ultimately present.
+        if await attachment_exists_on_transaction(mm, transaction_id, attachment):
+            return None
+
+    original_asset_url = attachment.get("originalAssetUrl")
+    if not original_asset_url:
+        return direct_failure_reason or "attachment has no originalAssetUrl and direct link failed"
+
+    try:
+        import aiohttp
+    except Exception:
+        return "aiohttp is unavailable for attachment clone fallback"
+
+    try:
+        upload_info_response = await with_spinner(
+            mm.get_transaction_attachment_upload_info(transaction_id=transaction_id)
+        )
+        info = ((upload_info_response or {}).get("getTransactionAttachmentUploadInfo") or {}).get("info") or {}
+        upload_path = info.get("path")
+        request_params = info.get("requestParams") or {}
+        if not upload_path:
+            return "upload info missing path"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(str(original_asset_url)) as download_response:
+                if download_response.status >= 400:
+                    return f"download failed ({download_response.status})"
+                file_content = await download_response.read()
+
+            form = aiohttp.FormData()
+            for key, value in request_params.items():
+                if value is not None:
+                    form.add_field(str(key), str(value))
+            mime_type = mimetypes.guess_type(str(filename))[0] or "application/octet-stream"
+            form.add_field("file", file_content, filename=str(filename), content_type=mime_type)
+
+            async with session.post(str(upload_path), data=form) as upload_response:
+                if upload_response.status >= 400:
+                    body = await upload_response.text()
+                    return f"upload failed ({upload_response.status}): {truncate(body, 120)}"
+                upload_payload = await upload_response.json(content_type=None)
+
+        uploaded_public_id = upload_payload.get("public_id") or upload_payload.get("publicId")
+        if not uploaded_public_id:
+            return "upload response missing public_id"
+        uploaded_size = upload_payload.get("bytes")
+        try:
+            final_size = int(uploaded_size) if uploaded_size is not None else max(size_value, 1)
+        except (TypeError, ValueError):
+            final_size = max(size_value, 1)
+
+        add_response = await with_spinner(
+            mm.add_transaction_attachment(
+                {
+                    "transactionId": transaction_id,
+                    "publicId": str(uploaded_public_id),
+                    "filename": str(filename),
+                    "extension": str(extension),
+                    "sizeBytes": final_size,
+                }
+            )
+        )
+        add_errors = ((add_response or {}).get("addTransactionAttachment") or {}).get("errors") or []
+        if add_errors:
+            return _message_from_payload_error(add_errors[0])
+        return None
+    except Exception as exc:
+        # If fallback fails, check one last time before warning.
+        if await attachment_exists_on_transaction(mm, transaction_id, attachment):
+            return None
+        if direct_failure_reason:
+            return f"{direct_failure_reason}; fallback failed: {exc}"
+        return str(exc)
+
+
+async def apply_split_post_updates(
+    mm: Any,
+    split_transactions: List[Dict[str, Any]],
+    notes_by_category_id: Dict[str, str],
+    mark_reviewed: bool,
+    source_tag_ids: List[str],
+    source_attachments: List[Dict[str, Any]],
+) -> None:
+    for split_tx in split_transactions:
+        split_id = split_tx.get("id")
+        if not split_id:
+            continue
+        category_id = str(((split_tx.get("category") or {}).get("id")) or "")
+        note = notes_by_category_id.get(category_id)
+        needs_review = not mark_reviewed
+
+        if note is not None or needs_review is not None:
+            try:
+                response = await with_spinner(
+                    mm.update_transaction(
+                        transaction_id=split_id,
+                        needs_review=needs_review,
+                        notes=note,
+                    )
+                )
+                errors = ((response or {}).get("updateTransaction") or {}).get("errors") or []
+                if errors:
+                    print(
+                        "Warning: failed to update split transaction metadata: "
+                        f"{errors[0].get('message', 'unknown error')}"
+                    )
+            except Exception as exc:
+                print(f"Warning: failed to update split transaction metadata: {exc}")
+
+        if source_tag_ids:
+            try:
+                tag_response = await with_spinner(
+                    mm.set_transaction_tags(transaction_id=split_id, tag_ids=source_tag_ids)
+                )
+                tag_errors = ((tag_response or {}).get("setTransactionTags") or {}).get("errors") or []
+                if tag_errors:
+                    print(
+                        "Warning: failed to copy tags to split transaction: "
+                        f"{tag_errors[0].get('message', 'unknown error')}"
+                    )
+            except Exception as exc:
+                print(f"Warning: failed to copy tags to split transaction: {exc}")
+
+        for attachment in source_attachments:
+            warning = await clone_attachment_to_transaction(mm, split_id, attachment)
+            if warning:
+                print(f"Warning: failed to copy attachment to split transaction: {warning}")
 
 
 def category_group_type(category: Dict[str, Any]) -> str:
@@ -248,7 +519,13 @@ def build_category_menu(
             group_order.append(group_key)
         group_items[group_key].append(cat)
 
-    for group_type, group_name in group_order:
+    group_type_order = {"income": 0, "expense": 1, "transfer": 2, "other": 3}
+    ordered_groups = sorted(
+        group_order,
+        key=lambda item: (group_type_order.get(item[0], 9), item[1].lower()),
+    )
+
+    for group_type, group_name in ordered_groups:
         heading = style(
             group_name,
             color=color_by_type.get(group_type, "36"),
@@ -259,7 +536,7 @@ def build_category_menu(
         selectable.append(False)
         search_texts.append("")
         category_for_option.append(None)
-        for cat in group_items[(group_type, group_name)]:
+        for cat in sorted(group_items[(group_type, group_name)], key=lambda item: str(item.get("name", "")).lower()):
             options.append(f"  {cat.get('name', 'Unknown')}")
             selectable.append(True)
             search_texts.append(f"{group_name} {cat.get('name', '')}".lower())
@@ -393,7 +670,6 @@ def select_line_items_and_categories_tui(
     index_to_item: Dict[int, Dict[str, Any]] = {i: item for i, item in enumerate(line_items)}
     assignments: Dict[str, Dict[str, Any]] = dict(initial_assignments or {})
     selected: set[int] = set()
-    history: List[Dict[str, Optional[Dict[str, Any]]]] = []
     cursor = 0
     status = ""
     preferred_type = "expense" if (to_decimal(transaction_amount) or 0) < 0 else "income"
@@ -411,7 +687,7 @@ def select_line_items_and_categories_tui(
             )
             lines.append(
                 "\u2191/\u2193 move | space select | enter assign category | "
-                "u undo | d done | b back | q quit"
+                "a all unassigned | i invert unassigned | d done | b back | q quit"
             )
             if status:
                 lines.append(style(status, color="33", use_color=use_color))
@@ -476,21 +752,37 @@ def select_line_items_and_categories_tui(
                 else:
                     selected.add(cursor)
                 continue
+            if key == "a":
+                unassigned_indexes = {
+                    idx for idx, item in index_to_item.items() if str(item.get("id")) not in assignments
+                }
+                if not unassigned_indexes:
+                    status = "All items are already assigned."
+                    continue
+                if unassigned_indexes.issubset(selected):
+                    selected.difference_update(unassigned_indexes)
+                    status = "Unselected all unassigned items."
+                else:
+                    selected.update(unassigned_indexes)
+                    status = "Selected all unassigned items."
+                continue
+            if key == "i":
+                unassigned_indexes = {
+                    idx for idx, item in index_to_item.items() if str(item.get("id")) not in assignments
+                }
+                if not unassigned_indexes:
+                    status = "All items are already assigned."
+                    continue
+                for idx in unassigned_indexes:
+                    if idx in selected:
+                        selected.remove(idx)
+                    else:
+                        selected.add(idx)
+                continue
             if key in {"b", "esc"}:
                 return BACK
             if key == "q":
                 return QUIT
-            if key == "u":
-                if not history:
-                    status = "Nothing to undo."
-                    continue
-                previous = history.pop()
-                for item_id, old_cat in previous.items():
-                    if old_cat is None:
-                        assignments.pop(item_id, None)
-                    else:
-                        assignments[item_id] = old_cat
-                continue
             if key == "d":
                 if assigned_count == len(line_items):
                     return assignments
@@ -513,12 +805,9 @@ def select_line_items_and_categories_tui(
                 if category == QUIT:
                     return QUIT
 
-                previous_state: Dict[str, Optional[Dict[str, Any]]] = {}
                 for idx in target_indexes:
                     item_id = str(index_to_item[idx].get("id"))
-                    previous_state[item_id] = assignments.get(item_id)
                     assignments[item_id] = category
-                history.append(previous_state)
                 selected.clear()
                 continue
 
@@ -546,13 +835,12 @@ def select_line_items_and_categories(
 
     index_to_item: Dict[int, Dict[str, Any]] = {i + 1: item for i, item in enumerate(line_items)}
     assignments: Dict[str, Dict[str, Any]] = dict(initial_assignments or {})
-    history: List[Dict[str, Optional[Dict[str, Any]]]] = []
     preferred_type = "expense" if (to_decimal(transaction_amount) or 0) < 0 else "income"
 
     while True:
         print()
         print(style("Assign Categories To Line Items", bold=True, color="36", use_color=use_color))
-        print("Commands: numbers (e.g. 1,3), a=all unassigned, u=undo, d=done, b=back, q=quit")
+        print("Commands: numbers (e.g. 1,3), a=all unassigned, i=invert unassigned, d=done, b=back, q=quit")
 
         all_assigned = True
         for index, item in index_to_item.items():
@@ -585,19 +873,13 @@ def select_line_items_and_categories(
             return BACK
         if raw in {"q", "quit"}:
             return QUIT
-        if raw in {"u", "undo"}:
-            if not history:
-                print("Nothing to undo.")
-                continue
-            previous = history.pop()
-            for item_id, old_cat in previous.items():
-                if old_cat is None:
-                    assignments.pop(item_id, None)
-                else:
-                    assignments[item_id] = old_cat
-            continue
 
         if raw in {"a", "all"}:
+            selected_indexes = [idx for idx, item in index_to_item.items() if str(item.get("id")) not in assignments]
+            if not selected_indexes:
+                print("All items are already assigned.")
+                continue
+        elif raw in {"i", "invert"}:
             selected_indexes = [idx for idx, item in index_to_item.items() if str(item.get("id")) not in assignments]
             if not selected_indexes:
                 print("All items are already assigned.")
@@ -629,12 +911,9 @@ def select_line_items_and_categories(
         if category == QUIT:
             return QUIT
 
-        previous_state: Dict[str, Optional[Dict[str, Any]]] = {}
         for idx in selected_indexes:
             item_id = str(index_to_item[idx].get("id"))
-            previous_state[item_id] = assignments.get(item_id)
             assignments[item_id] = category
-        history.append(previous_state)
 
 
 def distribute_delta(base_by_category_id: Dict[str, Decimal], delta: Decimal) -> Dict[str, Decimal]:
@@ -713,6 +992,7 @@ def build_split_plan(
 
         preview_rows.append(
             {
+                "category_id": category_id,
                 "category_name": category.get("name", category_id),
                 "line_item_count": count_by_category.get(category_id, 0),
                 "base": base,
@@ -816,11 +1096,25 @@ async def run_match_flow(mm: Any, review_transactions: List[Dict[str, Any]], use
     if not categories:
         raise RuntimeError("No active categories found in Monarch.")
 
-    syncs = await get_retail_syncs(mm)
+    sync_sources = await load_receipt_sync_sources(primary_mm=mm)
+    sync_entries: List[Dict[str, Any]] = []
+    for source in sync_sources:
+        try:
+            source_syncs = await get_retail_syncs(source["mm"])
+        except Exception as exc:
+            print(f"Warning: failed to load retail syncs from {source.get('label', '-')}: {exc}")
+            continue
+        for sync in source_syncs:
+            sync_entries.append({"source": source, "sync": sync})
+
+    if not sync_entries:
+        print("No retail sync data found in the connected receipt sync accounts.")
+        return 0
+
     candidates_by_tx: Dict[str, List[Dict[str, Any]]] = {}
     for tx in transactions:
         tx_id = str(tx.get("id", ""))
-        candidates = build_order_candidates(tx, syncs)
+        candidates = build_order_candidates(tx, sync_entries)
         if candidates:
             candidates_by_tx[tx_id] = candidates
 
@@ -864,6 +1158,11 @@ async def run_match_flow(mm: Any, review_transactions: List[Dict[str, Any]], use
                     order,
                     assignments,
                 )
+                line_item_notes_by_category = build_line_item_notes_by_category(order, assignments)
+                mark_reviewed = prompt_yes_no(
+                    style("Mark resulting transaction(s) as reviewed?", color="36", use_color=use_color),
+                    default=False,
+                )
                 print_split_preview(preview_rows, tx_amount, line_total, delta, order, use_color=use_color)
                 prompt_text = style("Create these splits?", color="36", use_color=use_color)
                 confirm = prompt(prompt_text + " [Y]/n, b back, q quit: ").strip().lower()
@@ -877,6 +1176,44 @@ async def run_match_flow(mm: Any, review_transactions: List[Dict[str, Any]], use
                     print("Invalid choice.")
                     continue
 
+                if len(split_data) == 1:
+                    single_split = split_data[0]
+                    single_category_id = str(single_split.get("categoryId") or "")
+                    single_note = line_item_notes_by_category.get(single_category_id)
+                    await maybe_match_retail_transaction(mm, selected_tx, candidate)
+                    response = await with_spinner(
+                        mm.update_transaction(
+                            transaction_id=selected_tx.get("id"),
+                            category_id=single_split.get("categoryId"),
+                            needs_review=not mark_reviewed,
+                            notes=single_note,
+                        )
+                    )
+                    errors = ((response or {}).get("updateTransaction") or {}).get("errors") or []
+                    if errors:
+                        raise RuntimeError(
+                            f"Failed to update transaction: {errors[0].get('message', 'unknown error')}"
+                        )
+                    print(
+                        style(
+                            "Transaction updated successfully (single category selected, no split created).",
+                            color="32",
+                            bold=True,
+                            use_color=use_color,
+                        )
+                    )
+                    return 0
+
+                source_tag_ids = [
+                    str(tag.get("id"))
+                    for tag in (selected_tx.get("tags") or [])
+                    if isinstance(tag, dict) and tag.get("id")
+                ]
+                source_attachments = [
+                    attachment
+                    for attachment in (selected_tx.get("attachments") or [])
+                    if isinstance(attachment, dict)
+                ]
                 await maybe_match_retail_transaction(mm, selected_tx, candidate)
                 response = await with_spinner(
                     mm.update_transaction_splits(
@@ -889,6 +1226,18 @@ async def run_match_flow(mm: Any, review_transactions: List[Dict[str, Any]], use
                     raise RuntimeError(
                         f"Failed to create splits: {errors[0].get('message', 'unknown error')}"
                     )
+
+                split_transactions = (
+                    ((response or {}).get("updateTransactionSplit") or {}).get("transaction") or {}
+                ).get("splitTransactions") or []
+                await apply_split_post_updates(
+                    mm=mm,
+                    split_transactions=split_transactions,
+                    notes_by_category_id=line_item_notes_by_category,
+                    mark_reviewed=mark_reviewed,
+                    source_tag_ids=source_tag_ids,
+                    source_attachments=source_attachments,
+                )
 
                 print(style("Split transaction updated successfully.", color="32", bold=True, use_color=use_color))
                 return 0
